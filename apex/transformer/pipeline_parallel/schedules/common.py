@@ -1,14 +1,12 @@
-# NOTE(mkozuki): For simplicity, tentatively `timers` related operations are commented out.
-from typing import Any, Callable, Dict, List, Tuple, Union, Optional, Sequence
+# NOTE (mkozuki): For simplicity, tentatively `timers` related operations are commented out.
+from typing import Any, Callable, Dict, List, Tuple, Union, Optional
 
 import torch
 
 from apex.transformer import parallel_state
-from apex.transformer.enums import ModelType
 from apex.transformer.pipeline_parallel.utils import get_num_microbatches
 from apex.transformer.pipeline_parallel.utils import listify_model
 from apex.transformer.pipeline_parallel.utils import unwrap_model
-from apex.transformer.pipeline_parallel.utils import get_model_type
 from apex.transformer.tensor_parallel.layers import set_defaults_if_not_set_tensor_model_parallel_attributes
 
 
@@ -21,8 +19,8 @@ def build_model(
         model_provider_func: Callable[[Any, Dict[str, Any]], torch.nn.Module],
         wrap_with_ddp: bool = True,
         virtual_pipeline_model_parallel_size: Optional[int] = None,
-        *args: Any,
-        **kwargs: Any,
+        *args,
+        **kwargs
 ) -> List[torch.nn.Module]:
     """Build the model satisfying pipeline model parallel requirements.
 
@@ -82,11 +80,11 @@ def build_model(
             set_defaults_if_not_set_tensor_model_parallel_attributes(param)
 
     # Print number of parameters.
-    if parallel_state.model_parallel_is_initialized() and parallel_state.get_data_parallel_rank() == 0:
+    if parallel_state.get_data_parallel_rank() == 0:
         msg = " > number of parameters on (tensor, pipeline) model parallel rank ({}, {}): {}".format(
             parallel_state.get_tensor_model_parallel_rank(),
             parallel_state.get_pipeline_model_parallel_rank(),
-            _calc_number_of_params(model),
+            sum([sum([p.nelement() for p in model_module.parameters()]) for model_module in model])
         )
         print(msg, flush=True)
 
@@ -108,16 +106,10 @@ def build_model(
     return model
 
 
-def _calc_number_of_params(model: List[torch.nn.Module]) -> int:
-    assert isinstance(model, list)
-    return sum([sum([p.nelement() for p in model_module.parameters()]) for model_module in model])
-
-
 def _get_params_for_weight_decay_optimization(
         model: Union[torch.nn.Module, List[torch.nn.Module]],
 ) -> Dict[str, torch.nn.Parameter]:
     """Divide params into with-weight-decay and without-weight-decay groups.
-
     Layernorms and biases will have no weight decay but the rest will.
     """
     modules = listify_model(model)
@@ -145,12 +137,13 @@ def forward_step(
         forward_step_func: FwdStepFunc,
         batch: Batch,
         model: torch.nn.Module,
-        input_tensor: Optional[Union[torch.Tensor, List[torch.Tensor]]],
+        input_tensor: Optional[torch.Tensor],
         losses_reduced: List[torch.Tensor],
-) -> Union[torch.Tensor, Sequence[torch.Tensor]]:
+):
     """Forward step for passed-in model.
 
-    If first stage, input tensor is obtained from batch, otherwise passed-in input_tensor is used.
+    If first stage, input tensor is obtained from data_iterator, otherwise
+    passed-in input_tensor is used.
 
     Returns output tensor.
 
@@ -168,16 +161,12 @@ def forward_step(
     # timers = get_timers()
     # timers("forward-compute").start()
     unwrapped_model = unwrap_model(model)
-    model_type = get_model_type(unwrapped_model)
     # NOTE (mkozuki): The passed `model` is expected to implement `set_input_tensor`.
     # See https://github.com/NVIDIA/Megatron-LM/blob/5ac5571ba0265af4c491ee0af1508ca7589450c6/megatron/model/transformer.py#L679  # NOQA
     # for the details of `set_input_tensor`.
-    unwrap_output_tensor = not isinstance(input_tensor, list)
-    if unwrap_output_tensor:
-        input_tensor = [input_tensor]
-
     unwrapped_model.set_input_tensor(input_tensor)
     output_tensor, loss_func = forward_step_func(batch, model)
+    # print(f"forward_step| pipeline rank: {parallel_state.get_pipeline_model_parallel_rank()} is_pipeline_last_stage?: {parallel_state.is_pipeline_last_stage()}")
     if parallel_state.is_pipeline_last_stage():
         output_tensor = loss_func(output_tensor)
         loss, loss_reduced = output_tensor
@@ -185,22 +174,14 @@ def forward_step(
         losses_reduced.append(loss_reduced)
     # timers("forward-compute").stop()
 
-    # If T5 model (or other model with encoder and decoder)
-    # and in decoder stack, then send encoder_hidden_state
-    # downstream as well.
-    if parallel_state.is_pipeline_stage_after_split() and model_type == ModelType.encoder_and_decoder:
-        return [output_tensor, input_tensor[-1]]
-    if unwrap_output_tensor:
-        return output_tensor
-    return [output_tensor]
+    return output_tensor
 
 
 def backward_step(
         input_tensor: Optional[torch.Tensor],
         output_tensor: torch.Tensor,
         output_tensor_grad: Optional[torch.Tensor],
-        model_type: ModelType,
-) -> Union[None, torch.Tensor, Sequence[torch.Tensor]]:
+) -> Optional[torch.Tensor]:
     """Backward step through passed-in output tensor.
 
     If last stage, output_tensor_grad is None, otherwise gradient of loss
@@ -219,39 +200,19 @@ def backward_step(
 
     # timers = get_timers()
     # timers("backward-compute").start()
-
     # Retain the grad on the input_tensor.
-    unwrap_input_tensor_grad = not isinstance(input_tensor, list)
-    if unwrap_input_tensor_grad:
-        input_tensor = [input_tensor]
-    for x in input_tensor:
-        if x is not None:
-            x.retain_grad()
 
-    if not isinstance(output_tensor, list):
-        output_tensor = [output_tensor]
-    if not isinstance(output_tensor_grad, list):
-        output_tensor_grad = [output_tensor_grad]
-
-    # Backward pass.
-    torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
-
-    # Collect the grad of the input_tensor.
-    input_tensor_grad = [None]
+    # if parallel_state.get_pipeline_model_parallel_rank() == 0:
+    #     print(f"{input_tensor}, {output_tensor}, {output_tensor_grad}")
     if input_tensor is not None:
-        input_tensor_grad = []
-        for x in input_tensor:
-            input_tensor_grad.append(None if x is None else x.grad)
-
-    # Handle single skip connection if it exists (encoder_hidden_state in model with encoder and decoder).
-    if (
-            parallel_state.get_pipeline_model_parallel_world_size() > 1 and
-            parallel_state.is_pipeline_stage_after_split() and
-            model_type == ModelType.encoder_and_decoder
-    ):
-        if output_tensor_grad[1] is not None:
-            # todo (mkozuki): Replace the inplace add with `+= output_tensor_grad[1]`?
-            input_tensor_grad[-1].add_(output_tensor_grad[1])
-
+        input_tensor.retain_grad()
+    # Backward pass.
+    # if output_tensor_grad is None:
+    #     output_tensor = optimizer.scale_loss(output_tensor)
+    torch.autograd.backward(output_tensor, grad_tensors=output_tensor_grad)
+    input_tensor_grad = None
+    if input_tensor is not None:
+        input_tensor_grad = input_tensor.grad
     # timers("backward-compute").stop()
-    return input_tensor_grad[0] if unwrap_input_tensor_grad else input_tensor_grad
+
+    return input_tensor_grad

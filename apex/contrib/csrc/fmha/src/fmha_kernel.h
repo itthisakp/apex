@@ -27,7 +27,7 @@
 
 #pragma once
 
-#include <multihead_attn/philox.cuh>
+#include <multihead_attn/philox.h>
 
 #include <fmha.h>
 #include <fmha/utils.h>

@@ -20,12 +20,10 @@ import torch
 from torch.nn.parallel import DistributedDataParallel
 
 from apex.multi_tensor_apply import multi_tensor_applier
+import amp_C
 from apex.transformer import parallel_state
-from apex.transformer.enums import ModelType
 from apex.transformer.microbatches import build_num_microbatches_calculator
 from apex.transformer.pipeline_parallel._timers import _Timers
-if multi_tensor_applier.available:
-    import amp_C
 
 
 _GLOBAL_ARGS = None
@@ -64,22 +62,6 @@ def setup_microbatch_calculator(
 ) -> None:
     global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
     _ensure_var_is_not_initialized(_GLOBAL_NUM_MICROBATCHES_CALCULATOR, 'num microbatches calculator')
-
-    _GLOBAL_NUM_MICROBATCHES_CALCULATOR = build_num_microbatches_calculator(
-        rank, rampup_batch_size, global_batch_size, micro_batch_size, data_parallel_size)
-
-
-def _reconfigure_microbatch_calculator(
-        rank: int,
-        rampup_batch_size: Optional[List[int]],
-        global_batch_size: int,
-        micro_batch_size: int,
-        data_parallel_size: int,
-) -> None:
-    if torch.distributed.get_rank() == 0:
-        import warnings
-        warnings.warn("This function is only for unittest")
-    global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
 
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = build_num_microbatches_calculator(
         rank, rampup_batch_size, global_batch_size, micro_batch_size, data_parallel_size)
@@ -126,15 +108,7 @@ def get_kth_microbatch(batch: List[torch.Tensor], k: int) -> List[torch.Tensor]:
     `a local minibatch` consists of `global_batch_size / data_parallel_size` samples.
     """
     micro_batch_size = get_micro_batch_size()
-    start = k * micro_batch_size
-    end = start + micro_batch_size
-    microbatch = list()
-    for x in batch:
-        size = x.size(0)
-        assert size > start and size >= end
-        microbatch.append(x[start:end])
-    assert len(microbatch) > 0
-    return microbatch
+    return [x[k * micro_batch_size:(k + 1) * micro_batch_size] for x in batch]
 
 
 def get_autoresume():
@@ -193,19 +167,6 @@ def unwrap_model(model, module_instances=(DistributedDataParallel,)):
     if not return_list:
         return unwrapped_model[0]
     return unwrapped_model
-
-
-def get_model_type(
-        model: torch.nn.Module,
-) -> ModelType:
-    """Get `model_type` of `model`.
-
-    If ``model`` doesn't have ``model_type`` attribute, return ``ModelType.encoder_or_decoder``.
-
-    Args:
-        model
-    """
-    return getattr(unwrap_model(model), "model_type", ModelType.encoder_or_decoder)
 
 
 def calc_params_l2_norm(model: torch.nn.Module, bf16: bool):
